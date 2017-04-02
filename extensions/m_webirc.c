@@ -38,6 +38,20 @@
  * real host/ip.
  * The password should be specified unencrypted in webirc_password in
  * cgiirc.config
+ *
+ * Usage for WEBIRC v2:
+ * auth {
+ *   user = "<service|*>@<certfp>"; # service should be e.g. 'kiwiirc'
+ *   flags = ~encrypted;
+ *   password = "*";
+ *   spoof = "webirc.";
+ *   class = "users";
+ * };
+ * certfp is required for WEBIRC v2 authentication. This is a quick hack to
+ * implement a reference implementation of WEBIRC v2; future implementations
+ * will likely add a fingerprint= to auth{} blocks to restrict them to clients
+ * with the specified certificate fingerprint, webirc or otherwise.
+ * See also "Changes for WEBIRC v2" below.
  */
 
 #include "stdinc.h"
@@ -68,41 +82,76 @@ DECLARE_MODULE_AV1(webirc, NULL, NULL, webirc_clist, NULL, NULL, "$Revision: 207
 /*
  * mr_webirc - webirc message handler
  *      parv[1] = password
- *      parv[2] = fake username (we ignore this)
+ *      parv[2] = gateway service name (e.g. mibbit or kiwiirc)
  *	parv[3] = fake hostname
  *	parv[4] = fake ip
+ *
+ * Changes for WEBIRC v2:
+ *  - All errors are fatal and will result in the client being disconnected.
+ *  - All WEBIRC errors start with "ERROR :WEBIRC".
+ *  - Password "*" is used to specify that the WEBIRC client wishes to
+ *    authenticate via certfp.
+ *  - Gateway service name is now used as the username to search for ilines.
+ *  - Failing to find a WEBIRC block after receiving a WEBIRC message is a
+ *    fatal error.
  */
 static int
 mr_webirc(struct Client *client_p, struct Client *source_p, int parc, const char *parv[])
 {
-	struct ConfItem *aconf;
+	struct ConfItem *aconf = NULL;
 	const char *encr;
 	struct rb_sockaddr_storage addr;
+	const char *passwd = parv[1];
+	const char *svc_name = parv[2];
 
 	if ((!strchr(parv[4], '.') && !strchr(parv[4], ':')) ||
 			strlen(parv[4]) + (*parv[4] == ':') >=
 			sizeof(source_p->sockhost))
 	{
-		sendto_one(source_p, "NOTICE * :Invalid IP");
+		sendto_one(source_p, "ERROR :WEBIRC invalid IP");
+		exit_client(client_p, client_p, client_p, "WEBIRC invalid IP");
 		return 0;
 	}
 
-	aconf = find_address_conf(client_p->host, client_p->sockhost,
-				IsGotId(client_p) ? client_p->username : "webirc",
-				IsGotId(client_p) ? client_p->username : "webirc",
-				(struct sockaddr *) &client_p->localClient->ip,
-				client_p->localClient->ip.ss_family, NULL);
-	if (aconf == NULL || !(aconf->status & CONF_CLIENT))
-		return 0;
-	if (!IsConfDoSpoofIp(aconf) || irccmp(aconf->info.name, "webirc."))
+	if (strcmp(passwd, "*") == 0) {
+		if (client_p->certfp) {
+			aconf = find_address_conf(client_p->certfp, NULL,
+					svc_name, svc_name,
+					(struct sockaddr *) &client_p->localClient->ip,
+					client_p->localClient->ip.ss_family, NULL);
+			if (strcasecmp(aconf->host, client_p->certfp) != 0) {
+				sendto_realops_snomask(SNO_DEBUG, L_ALL,
+					"certfp mismatch for WEBIRC client %s: %s != %s",
+					svc_name, client_p->certfp, aconf->host);
+				aconf = NULL;
+			}
+		} else {
+			sendto_one(source_p, "ERROR :WEBIRC fingerprint authentication "
+				   "requires a TLS client certificate and TLS connection");
+			exit_client(client_p, client_p, client_p, "WEBIRC no certfp");
+			return 0;
+		}
+	} else {
+		aconf = find_address_conf(client_p->host, client_p->sockhost,
+					IsGotId(client_p) ? client_p->username : "webirc",
+					IsGotId(client_p) ? client_p->username : "webirc",
+					(struct sockaddr *) &client_p->localClient->ip,
+					client_p->localClient->ip.ss_family, NULL);
+	}
+	if (aconf == NULL || !(aconf->status & CONF_CLIENT) ||
+		!IsConfDoSpoofIp(aconf) || irccmp(aconf->info.name, "webirc."))
 	{
 		/* XXX */
-		sendto_one(source_p, "NOTICE * :Not a CGI:IRC auth block");
+		sendto_one(source_p, "ERROR :WEBIRC failed to locate a matching "
+			"WEBIRC configuration");
+		exit_client(client_p, client_p, client_p, "WEBIRC not configured");
 		return 0;
 	}
 	if (EmptyString(aconf->passwd))
 	{
-		sendto_one(source_p, "NOTICE * :CGI:IRC auth blocks must have a password");
+		sendto_one(source_p, "ERROR :WEBIRC configuration is invalid");
+		exit_client(client_p, client_p, client_p,
+			"WEBIRC invalid configuration");
 		return 0;
 	}
 
@@ -115,13 +164,15 @@ mr_webirc(struct Client *client_p, struct Client *source_p, int parc, const char
 
 	if (encr == NULL || strcmp(encr, aconf->passwd))
 	{
-		sendto_one(source_p, "NOTICE * :CGI:IRC password incorrect");
+		sendto_one(source_p, "ERROR :WEBIRC password incorrect");
+		exit_client(client_p, client_p, client_p, "WEBIRC bad password");
 		return 0;
 	}
 
 	if (rb_inet_pton_sock(parv[4], (struct sockaddr *)&addr) <= 0)
 	{
-		sendto_one(source_p, "NOTICE * :Invalid IP");
+		sendto_one(source_p, "ERROR :WEBIRC invalid IP");
+		exit_client(client_p, client_p, client_p, "WEBIRC invalid IP");
 		return 0;
 	}
 
@@ -153,6 +204,6 @@ mr_webirc(struct Client *client_p, struct Client *source_p, int parc, const char
 		}
 	}
 
-	sendto_one(source_p, "NOTICE * :CGI:IRC host/IP set to %s %s", parv[3], parv[4]);
+	sendto_one(source_p, "NOTICE * :WEBIRC setting host and IP to %s %s", parv[3], parv[4]);
 	return 0;
 }
